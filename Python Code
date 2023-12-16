@@ -1,0 +1,496 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# ## 1. Parse sys args
+
+# In[1]:
+
+
+#Import sys
+import sys
+#parse args to variables
+try:
+    script = sys.argv[0]
+    database = sys.argv[1]
+    server = sys.argv[2]
+    auditKey = sys.argv[3]
+    username = sys.argv[4]
+    password = sys.argv[5]
+    loadtype = sys.argv[6]
+    table = sys.argv[7]
+except Exception:
+    script = "Enter Script Name (Can be anyting)"
+    database = "Enter Database name"
+    server = "Enter Server Name"
+    auditKey = "Enter Your Audit Key"
+    username = "Enter applicationID from Azure APP"
+    password = "Enter password from Azure APP"
+    loadtype = "Enter Load Type ( Bulk or Incremental)"
+    table = "Enter Table Name"
+
+
+# ## 2. Connect to Datawarehouse
+
+# In[2]:
+
+
+#Import pyodbc to determine available drivers
+import pyodbc
+#find the best driver available
+driver_name = ''
+driver_names = [x for x in pyodbc.drivers() if x.endswith(' for SQL Server')]
+if driver_names:
+    driver_name = driver_names[0]
+else:
+    print('(No suitable driver found. Cannot connect.)')
+    
+#Import sql alchemy to enable connection
+import sqlalchemy as sa
+#Create a sql engine
+from sqlalchemy.engine import URL
+connection_string = "DRIVER={" + driver_name + "};SERVER=" + server + ";DATABASE=" + database + ";trusted_connection=yes"
+#connection_string = "DRIVER={SQL Server Native Client 11.0};Data Source=" + server + ";Initial Catalog=" + database + ";"
+connection_url = URL.create("mssql+pyodbc", query={"odbc_connect": connection_string})
+
+engine = sa.create_engine(connection_url)
+
+
+# ## 3. Create Functions
+
+# ### 3.1 Error Log Function
+
+# In[3]:
+
+
+#error log function needs predefined sql engine to log error to and error parameters
+def errorLog(engine, auditKey, e, detail=""):
+    import datetime
+    error_message = str(e).replace("'", "''") + detail
+    sql = f"""INSERT INTO log.Error 
+                (Audit_Key, [Error Code], [Error Description], [Date Time], [Package Name], [Source Name], [Source Description])
+              VALUES 
+                ('{auditKey}', 0, '{error_message}', '{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}', 'Execute External Job', 'Execute External Job', 'Execute External Job')
+            """
+    with engine.begin() as conn:
+        conn.execute(sa.text(sql))
+    raise e
+
+
+# ### 3.2 Object to String Function
+
+# In[4]:
+
+
+import pandas as pd
+def convert_objects_to_strings(data_frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert the `object` columns into `string`s so that SQLAlchemy can handle them"""
+    for col, col_type in data_frame.dtypes.items():
+        if col_type == 'object':
+            data_frame.loc[:, col] = data_frame.loc[:, col].astype('string')
+    return data_frame
+
+
+# ## 4. Import required libraries
+
+# In[5]:
+
+
+try:
+    import datetime
+    from datetime import timedelta
+    import pandas as pd
+    from azure.identity import ClientSecretCredential
+    import json, requests, pandas as pd
+    from sqlalchemy import create_engine, text, MetaData
+    import numpy as np
+    import urllib.parse
+    from datetime import datetime
+except Exception as e:
+    errorLog(engine,auditKey,e)
+    raise e
+
+
+# ## 5. Authenticate with PBI Admin API
+
+# In[6]:
+
+
+try:
+    tenant = 'Enter Tenant Id'
+    baseUrl = 'https://analysis.windows.net/powerbi/api/.default'
+    auth = ClientSecretCredential(
+        authority = 'https://login.microsoftonline.com/',
+        tenant_id = tenant,
+        client_id = username,
+        client_secret = password
+    )
+    access_token = auth.get_token(baseUrl).token
+except Exception as e:
+    errorLog(engine,auditKey,e)
+    raise e
+
+
+# ## 6. Retrieve Workspaces and Store in Data Frame
+
+# # Insersts PBIAPI_WorkspaceUserPriorization from SQL
+
+# In[9]:
+
+
+try:
+    workspace_base_url = 'https://api.powerbi.com/v1.0/myorg/admin/groups?$top=5000'
+    reports_base_url = 'https://api.powerbi.com/v1.0/myorg/admin/reports?$top=5000'
+    datasets_base_url = 'https://api.powerbi.com/v1.0/myorg/admin/datasets?$top=5000'
+    apps_base_url =  'https://api.powerbi.com/v1.0/myorg/admin/apps?$top=5000'
+    GetModifiedWorkspaces_base_url = 'https://api.powerbi.com/v1.0/myorg/admin/workspaces/modified'
+    groupusers_base_url ='https://api.powerbi.com/v1.0/myorg/admin/groups/{groupId}/users'
+    refresh_url = 'https://api.powerbi.com/v1.0/myorg/admin/capacities/refreshables'
+    App_Users_url = 'https://api.powerbi.com/v1.0/myorg/admin/apps/{appId}/users'
+    Activity_url  = "https://api.powerbi.com/v1.0/myorg/admin/activityevents?startDateTime={startDateTime}&endDateTime={endDateTime}"
+   
+
+    header = {'Authorization': f'Bearer {access_token}'}
+ 
+    
+    if table == "Workspaces":
+        base_url = workspace_base_url
+        response = requests.get(base_url, headers=header)
+        groups = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in groups['value']])
+        df = df.drop('defaultDatasetStorageFormat', axis=1)
+        df = df.rename(
+            columns={
+                'name': 'workspace_name',
+                'id': 'workspace_id',
+                'state': 'workspace_state'
+            }
+        )
+    
+    elif table == "Reports":
+        base_url = reports_base_url
+        response = requests.get(base_url, headers=header)
+        reports = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in reports['value']])
+        df = df.drop('users',axis=1)
+        df = df.drop('originalReportObjectId', axis=1)
+        df=df.drop('subscriptions',axis=1)
+        df = df.rename(
+            columns={
+                'id': 'report_id',
+                'name':'report_name',
+                'webUrl':'report_url',
+                'embedUrl':'report_embed_url',
+                'datasetId':'report_dataset_id'})
+        
+    elif table == "Datasets":
+        base_url = datasets_base_url
+        response = requests.get(base_url, headers=header)
+        datasets = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in datasets['value']])
+        columns_to_drop = ['queryScaleOutSettings.autoSyncReadOnlyReplicas', 'queryScaleOutSettings.maxReadOnlyReplicas']
+        df = df.drop(columns=columns_to_drop, axis=1)
+    
+    elif table == "Apps":
+        base_url = apps_base_url
+        response = requests.get(apps_base_url, headers=header)
+        datasets = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in datasets['value']])
+        df = df.drop('users', axis=1)
+        df = df.rename(
+            columns={
+                'id': 'app_id',
+                'workspaceId':'workspace_Id'})
+        
+        
+    elif table == "GetModifiedWorkspaces":
+        base_url = GetModifiedWorkspaces_base_url
+        response = requests.get(base_url, headers=header)
+        GetModifiedWorkspaces = json.loads(response.content)
+        df = pd.read_json(json.dumps(GetModifiedWorkspaces), orient='records')
+    
+
+    elif table == "WorkspaceUsers":
+        base_url = GetModifiedWorkspaces_base_url
+        response = requests.get(base_url, headers=header)
+        GetModifiedWorkspaces = json.loads(response.content)
+        df = pd.read_json(json.dumps(GetModifiedWorkspaces), orient='records')
+        WorkspaceUserPriorization = pd.read_sql_query( text('SELECT * FROM [lakehouse].[PBIAPI_WorkspaceUserPrioritization]'), con=engine.connect())
+        merged_df = pd.merge(WorkspaceUserPriorization,df,left_on='workspace_id',right_on='id',how='left')
+        merged_df['Updated'] = merged_df['id'].notnull().apply(lambda x: 1 if x else 0)
+        merged_df['LastUpdate'] = pd.to_datetime(merged_df['LastUpdate']).fillna(datetime.today() - timedelta(days=365*5))
+        merged_df = merged_df.loc[~merged_df['type'].isin(['Personal', 'PersonalGroup', 'AdminWorkspace'])]
+        merged_df=merged_df.sort_values(['Updated','LastUpdate','Activities'],ascending=[False, True,False]).head(25)
+        workspace_ids=merged_df['id']
+
+    ##Create an empty DataFrame to store the results
+        all_workspace_users = pd.DataFrame()
+        i = 0
+        for workspace_id in workspace_ids:
+            # Making the API request to get workspace users for each workspace_id
+            base_url = groupusers_base_url.format(groupId=workspace_id)
+            response = requests.get(base_url, headers=header)
+            try:
+                workspace_users = json.loads(response.content)
+                if 'error' in workspace_users:
+                    error_code = workspace_users['error']['code']
+                    if error_code == 'PowerBIEntityNotFound':
+                        print(f"Error: Power BI entity not found for workspace_id: {workspace_id}")
+                        continue
+                    else:
+                        print("Unexpected error in API response:")
+                        print(workspace_users)
+                        raise ValueError("Unexpected error in API response")
+                elif 'value' in workspace_users:
+                    df_workspace_users = pd.concat([pd.json_normalize(x) for x in workspace_users['value']])
+                    df_workspace_users['workspaceId'] = workspace_id # Rename 'groupId' to 'workspaceId'
+                    df_workspace_users = df_workspace_users[['workspaceId'] + list(df_workspace_users.columns[:-1])] # Place 'workspaceId' as the first column
+                    all_workspace_users = pd.concat([all_workspace_users, df_workspace_users])
+                    df = all_workspace_users                
+                else:
+                    print(f"No 'value' key found in the response for workspace_id: {workspace_id}")
+            except Exception as e:
+                print(f"Error: {str(e)}\nworkspace_users: {workspace_users}")
+                if str(e) == "No objects to concatenate":
+                    pass
+                else:
+                    errorLog(engine, auditKey, e, workspace_users['Message'])
+                    raise e
+            i+=1
+
+            
+    elif table == 'Refreshables':
+        base_url = refresh_url
+        response = requests.get(base_url, headers=header)
+        datasets = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in datasets['value']])
+        df = df.drop('lastRefresh.refreshAttempts', axis=1)
+        df[['configuredBy', 'refreshSchedule.days', 'refreshSchedule.times']] = df[['configuredBy', 'refreshSchedule.days', 'refreshSchedule.times']].apply(lambda x: x.astype(str))
+        df = df.rename(
+            columns={
+                'lastRefresh.id':'lastRefresh_id',
+                'lastRefresh.refreshType':'lastRefresh_refreshType',
+                'lastRefresh.startTime':'lastRefresh_startTime',
+                'lastRefresh.endTime':'lastRefresh_endTime',
+                'refreshSchedule.days':'refreshSchedule_days',
+                'refreshSchedule.times':'refreshSchedule_times ',
+                'refreshSchedule.enabled':'refreshSchedule_enabled',
+                'refreshSchedule.localTimeZoneId':'refreshSchedule_localTimeZoneId',
+                'refreshSchedule.notifyOption':'refreshSchedule_notifyOption',
+                'lastRefresh.serviceExceptionJson':'lastRefresh_serviceExceptionJson',
+                'lastRefresh.status':'lastRefresh_status',
+                'lastRefresh.requestId':'lastRefresh_requestId',
+                'lastRefresh.extendedStatus':'lastRefresh_extendedStatus'
+            })
+        
+        
+        
+        
+    elif table == "AppUsers":
+        base_url = apps_base_url
+        response = requests.get(apps_base_url, headers=header)
+        datasets = json.loads(response.content)
+        df = pd.concat([pd.json_normalize(x) for x in datasets['value']])
+        df = df.drop('users', axis=1)
+        df = df.rename(
+            columns={
+            'id': 'app_id',
+            'workspaceId':'workspace_Id'})
+        AppUserPrioritization = pd.read_sql_query(text('SELECT  * FROM [lakehouse].[PBIAPI_AppUserPrioritization]'), con=engine.connect())
+        merged_df = pd.merge(AppUserPrioritization, df, left_on='app_id', right_on='app_id', how='left')
+        merged_df['LastUpdate'].fillna(pd.Timestamp('2015-01-01T00:00:00.000Z'), inplace=True)
+        merged_df['lastUpdate'] = pd.to_datetime(merged_df['lastUpdate'], utc=True)
+        merged_df['LastUpdate'] = pd.to_datetime(merged_df['LastUpdate'], utc=True)
+        merged_df['date_diff'] = merged_df['lastUpdate'] - merged_df['LastUpdate']
+        merged_df = merged_df.sort_values(['date_diff','Activities'], ascending=[False,True]).head(10) # assign the sorted DataFrame back to merged_df
+        #merged_df['LastUpdate'] = merged_df['app_id'].notnull().apply(lambda x: 1 if x else 0)
+        #merged_df['LastUpdate'] = pd.to_datetime(merged_df['LastUpdate']).fillna(datetime.today() - timedelta(days=365*5))
+        app_ids=merged_df['app_id']
+
+    #Create an empty DataFrame to store the results
+        all_app_users = pd.DataFrame()
+
+        for app_id in app_ids:
+            base_url = App_Users_url.format(appId=app_id)
+            response = requests.get(base_url, headers=header)
+            app_users = json.loads(response.content)
+            df_app_users = pd.concat([pd.json_normalize(x) for x in app_users['value']])
+            df_app_users['app_id'] = app_id # Rename 'groupId' to 'app_id'
+            df_app_users = df_app_users[['app_id'] + list(df_app_users.columns[:-1])] 
+            all_app_users = pd.concat([all_app_users, df_app_users])
+            df = all_app_users
+
+    elif table == "Activity":
+        PBIActivityLoad_ProcessingWindows = pd.read_sql_query(text('SELECT * FROM [lakehouse].[PBIActivityLoad_ProcessingWindows]'), con=engine.connect())
+        df_list = []
+        for index, row in PBIActivityLoad_ProcessingWindows.iterrows():
+            start_time = row['WindowStart'].strftime('%Y-%m-%dT%H:%M:%SZ')
+            end_time = row['WindowEnd'].strftime('%Y-%m-%dT%H:%M:%SZ')
+            base_url = Activity_url.format(startDateTime="'"+start_time+"'", endDateTime="'"+end_time+"'")
+            i = 1
+            while True:
+                print("API Call {}".format(i))
+                response = requests.get(base_url, headers=header)
+                datasets = json.loads(response.content)
+                try:
+                    df = pd.concat([pd.json_normalize(x) for x in datasets['activityEventEntities']])
+                    df_list.append(df)
+                    if datasets['lastResultSet'] == False:
+                        base_url = datasets['continuationUri']
+                    else:
+                        break
+                except Exception as e:
+                    if str(e) == "No objects to concatenate":
+                        if datasets['lastResultSet'] == False:
+                            base_url = datasets['continuationUri']
+                            pass
+                        else:
+                            break
+                            pass
+                    else:
+                        errorLog(engine, auditKey, e)
+                        print(str(e))
+                        raise e
+                i+=1
+        df = pd.concat(df_list, ignore_index=True)
+        
+        operations_to_drop = [
+        'GetGroupUsers',
+        'GetGroupUsersAsAdmin',
+        'GetWorkspacesInfoAPI',
+        'GetWorkspacesInfoResult',
+        'GetSnapshots',
+        'GetRefreshablesAsAdmin',
+        'GetModifiedWorkspacesAPI',
+        'GetAppsAsAdmin',
+        'GenerateCustomVisualAADAccessToken',
+        'GetAppUsersAsAdmin',
+        'GetMyGoals',
+        'GetScorecards',
+        'GetWorkspaces',
+        'ExportActivityEvents',
+        'GetGroupsAsAdmin',
+        'BindMonikersToDatasources',
+        'GetReportsAsAdmin',
+        'GetCloudSupportedDatasources',
+        'GetAllGatewayClusterDatasources',
+        'GetGatewayClusters',
+        'GetDatasources',
+        'GetGatewayRegions',
+        'UpdateDatasourceCredentials',
+        'CreateEmailSubscription',
+        'GetGatewayClusterDatasourceStatus',
+        'GetUserDatasourcesByDataSourceReference',
+        'InstallTeamsAnalyticsReport',
+        'UpdateFeaturedTables'
+        'GatewayClustersObjectIds'
+        'ArtifactAccessRequestInfo.RequesterUserObjectId',]
+
+        # Drop rows with 'Operation' values in the list
+        df = df[~df['Operation'].isin(operations_to_drop)]
+        statement = text("""SELECT [columns].[name]
+        FROM [sys].[columns]
+        JOIN [sys].[tables] ON [tables].[object_id] = [columns].[object_id]
+        AND [tables].[name] = 'Activity'
+        JOIN [sys].[schemas] ON [schemas].[schema_id] = [tables].[schema_id]
+        AND [schemas].[name] = 'changeLog'""")
+        df_requiredColumns = pd.read_sql(statement, con=engine.connect())
+        # Filter 'df' to include only the columns present in 'df_requiredColumns'
+        required_columns = df_requiredColumns['name'].tolist()
+
+        # Filter 'df' to include only the columns present in both 'df' and 'df_requiredColumns'
+        df = df.drop_duplicates(subset=['Id'], keep='first')
+
+        # Filter 'df' to include only the columns present in both 'df' and 'df_requiredColumns'
+        existing_columns = [col for col in required_columns if col in df.columns]
+        df = df[existing_columns]
+except Exception as e:
+    errorLog(engine, auditKey, e)
+    print(str(e))
+    raise e        
+
+
+# ## 7. Insert workspaces into data lake
+
+# In[10]:
+
+
+try:
+    
+    if table == "Workspaces":
+            df.to_sql(
+            name ="Workspaces", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+        )
+    elif table == "Reports":
+            print("made it")
+            df.to_sql(
+            name ="Reports", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+        )
+    elif table == "Refreshables":
+            df.to_sql(
+            name ="Refreshables", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+            )
+    elif table == "Datasets":
+            df.to_sql(
+            name ="Datasets", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+         )
+    elif table == "WorkspaceUsers":
+         df.to_sql(
+            name ="WorkspaceUsers", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+         )
+    elif table == "Apps":
+         df.to_sql(
+            name ="Apps", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+         )
+    elif table == "AppUsers":
+         df.to_sql(
+            name ="AppUsers", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+        )
+    #elif table == "Activity":
+         #df.to_sql(
+            #name ="Activity", 
+            #schema ="changeLog", 
+            #con=engine, 
+            #index=False, 
+            #if_exists = "append"
+        #)
+    elif table == "Activity":
+         df = convert_objects_to_strings(df)
+         df.to_sql(
+            name ="Activity", 
+            schema ="Enter Schema name", 
+            con=engine, 
+            index=False, 
+            if_exists = "append"
+        )
+except Exception as e:
+    errorLog(engine, e)
+    raise e
+
